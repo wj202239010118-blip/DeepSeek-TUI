@@ -30,7 +30,10 @@ use crate::tui::approval::{
 };
 use crate::tui::history::HistoryCell;
 use crate::tui::scrolling::TranscriptLineMeta;
-use crate::{commands, config::COMMON_DEEPSEEK_MODELS};
+use crate::{
+    commands,
+    config::{ApiProvider, model_completion_names_for_provider},
+};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -634,18 +637,20 @@ impl Renderable for ComposerWidget<'_> {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border_color))
                 .style(background);
-            // Vim mode indicator — shown in the top-right corner of the
-            // composer border when vim editing is active.
+            // Top-right corner: keep only editor state here. Session titles
+            // belong in session/history surfaces, not in the input chrome.
             if self.app.composer.vim_enabled {
                 let color = match self.app.composer.vim_mode {
                     VimMode::Normal => palette::TEXT_MUTED,
                     VimMode::Insert => palette::DEEPSEEK_SKY,
                     VimMode::Visual => palette::MODE_PLAN,
                 };
-                let label = self.app.composer.vim_mode.label();
                 block = block.title_top(
-                    Line::from(Span::styled(label, Style::default().fg(color).bold()))
-                        .right_aligned(),
+                    Line::from(Span::styled(
+                        self.app.composer.vim_mode.label(),
+                        Style::default().fg(color).bold(),
+                    ))
+                    .right_aligned(),
                 );
             }
             if let Some(hint_line) = hint_line {
@@ -832,8 +837,24 @@ impl Renderable for ComposerWidget<'_> {
             };
             let menu_bottom = (menu_top + menu_visible_rows).min(menu_total);
 
-            // Label column width for two-column layout (name + description)
-            let label_width = 22.min(content_width.saturating_sub(4));
+            // Label column width — grows to fit the widest visible name
+            // (including alias hint like " or /bangzhu") but stays bounded.
+            let label_width = self
+                .slash_menu_entries
+                .iter()
+                .take(menu_bottom)
+                .skip(menu_top)
+                .map(|e| {
+                    if let Some(ref hint) = e.alias_hint {
+                        format!("{} or /{}", e.name, hint).width()
+                    } else {
+                        e.name.width()
+                    }
+                })
+                .max()
+                .unwrap_or(22)
+                .min(content_width.saturating_sub(4))
+                .max(8);
             for (idx, entry) in self
                 .slash_menu_entries
                 .iter()
@@ -867,12 +888,20 @@ impl Renderable for ComposerWidget<'_> {
                     Style::default().fg(palette::TEXT_DIM)
                 };
 
+                // Build display name: canonical name, with "or /alias" hint
+                // when the user typed via a pinyin alias.
+                let display_name = if let Some(ref hint) = entry.alias_hint {
+                    format!("{} or /{}", entry.name, hint)
+                } else {
+                    entry.name.clone()
+                };
+
                 let name_display = {
-                    let display_width: usize = entry.name.width();
+                    let display_width: usize = display_name.width();
                     if display_width > label_width {
                         let mut s = String::new();
                         let mut w = 0;
-                        for ch in entry.name.chars() {
+                        for ch in display_name.chars() {
                             let cw = ch.width().unwrap_or(0);
                             if w + cw + 1 > label_width {
                                 break;
@@ -888,7 +917,7 @@ impl Renderable for ComposerWidget<'_> {
                         s
                     } else {
                         // pad to label_width display cols
-                        let mut s = entry.name.clone();
+                        let mut s = display_name;
                         while s.width() < label_width {
                             s.push(' ');
                         }
@@ -1996,6 +2025,9 @@ pub(crate) struct SlashMenuEntry {
     pub name: String,
     pub description: String,
     pub is_skill: bool,
+    /// Matching pinyin/alias prefix hint, e.g. when user types `/bang` and
+    /// the command `/help` matches via alias `bangzhu`.
+    pub alias_hint: Option<String>,
 }
 
 pub(crate) fn slash_completion_hints(
@@ -2004,8 +2036,9 @@ pub(crate) fn slash_completion_hints(
     cached_skills: &[(String, String)],
     locale: crate::localization::Locale,
     workspace: Option<&std::path::Path>,
+    api_provider: ApiProvider,
 ) -> Vec<SlashMenuEntry> {
-    if !input.starts_with('/') {
+    if !super::app::looks_like_slash_command_input(input) {
         return Vec::new();
     }
 
@@ -2021,17 +2054,43 @@ pub(crate) fn slash_completion_hints(
     // built-in ones from the static registry and use a generic label for
     // user-defined commands.
     if completing_skill_arg.is_none() {
+        let prefix_lower = prefix.to_ascii_lowercase();
         for name in commands::all_command_names_matching(prefix, workspace) {
             let command_key = name.trim_start_matches('/');
-            let description = if let Some(info) = commands::get_command_info(command_key) {
-                info.description_for(locale).to_string()
-            } else {
-                String::from("User-defined command")
-            };
+            let (description, alias_hint) =
+                if let Some(info) = commands::get_command_info(command_key) {
+                    // Detect matching alias: if the user typed via pinyin rather
+                    // than the canonical name, record which alias matched.
+                    let hint = if !command_key.to_ascii_lowercase().starts_with(&prefix_lower) {
+                        info.aliases
+                            .iter()
+                            .find(|a| a.to_ascii_lowercase().starts_with(&prefix_lower))
+                            .map(|a| a.to_string())
+                    } else {
+                        None
+                    };
+                    let desc = if info.aliases.is_empty() {
+                        info.description_for(locale).to_string()
+                    } else {
+                        format!(
+                            "{}  (aliases: {})",
+                            info.description_for(locale),
+                            info.aliases
+                                .iter()
+                                .map(|a| format!("/{a}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    (desc, hint)
+                } else {
+                    (String::from("User-defined command"), None)
+                };
             entries.push(SlashMenuEntry {
                 name,
                 description,
                 is_skill: false,
+                alias_hint,
             });
         }
     }
@@ -2048,6 +2107,7 @@ pub(crate) fn slash_completion_hints(
                     name: format!("/skill {skill_name}"),
                     description: skill_desc.clone(),
                     is_skill: true,
+                    alias_hint: None,
                 });
             }
         }
@@ -2055,11 +2115,12 @@ pub(crate) fn slash_completion_hints(
 
     // Special: /model <name> completions when only /model matches
     if entries.iter().any(|e| e.name == "/model") && prefix_lower.eq_ignore_ascii_case("model") {
-        for model_name in COMMON_DEEPSEEK_MODELS {
+        for model_name in model_completion_names_for_provider(api_provider) {
             entries.push(SlashMenuEntry {
                 name: format!("/model {model_name}"),
                 description: String::from("Switch to this model"),
                 is_skill: false,
+                alias_hint: None,
             });
         }
     }
@@ -2216,7 +2277,7 @@ mod tests {
         cursor_row_col, layout_input, pad_lines_to_bottom, placeholder_visual_lines,
         should_render_empty_state, slash_completion_hints, wrap_input_lines, wrap_text,
     };
-    use crate::config::Config;
+    use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
     use crate::palette;
     use crate::tui::app::{App, ComposerDensity, TuiOptions};
@@ -2254,6 +2315,17 @@ mod tests {
             initial_input: None,
         };
         App::new(options, &Config::default())
+    }
+
+    fn buffer_text(buf: &Buffer, area: Rect) -> String {
+        let mut text = String::new();
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
     }
 
     #[test]
@@ -2407,14 +2479,14 @@ mod tests {
 
     #[test]
     fn slash_completion_hints_include_links_and_config() {
-        let hints = slash_completion_hints("/", 128, &[], Locale::En, None);
+        let hints = slash_completion_hints("/", 128, &[], Locale::En, None, ApiProvider::Deepseek);
         assert!(hints.iter().any(|hint| hint.name == "/config"));
         assert!(hints.iter().any(|hint| hint.name == "/links"));
     }
 
     #[test]
     fn slash_completion_hints_exclude_set_and_deepseek_commands() {
-        let hints = slash_completion_hints("/", 128, &[], Locale::En, None);
+        let hints = slash_completion_hints("/", 128, &[], Locale::En, None, ApiProvider::Deepseek);
         assert!(!hints.iter().any(|hint| hint.name == "/set"));
         assert!(!hints.iter().any(|hint| hint.name == "/deepseek"));
     }
@@ -2425,7 +2497,14 @@ mod tests {
             ("search-files".to_string(), "Search files".to_string()),
             ("my-review".to_string(), "Review code".to_string()),
         ];
-        let hints = slash_completion_hints("/", 128, &cached_skills, Locale::En, None);
+        let hints = slash_completion_hints(
+            "/",
+            128,
+            &cached_skills,
+            Locale::En,
+            None,
+            ApiProvider::Deepseek,
+        );
         assert!(hints.iter().any(|hint| hint.name == "/skill"));
         assert!(hints.iter().any(|hint| hint.name == "/skills"));
         assert!(!hints.iter().any(|hint| hint.is_skill));
@@ -2437,7 +2516,14 @@ mod tests {
             ("search-files".to_string(), "Search files".to_string()),
             ("my-review".to_string(), "Review code".to_string()),
         ];
-        let hints = slash_completion_hints("/se", 128, &cached_skills, Locale::En, None);
+        let hints = slash_completion_hints(
+            "/se",
+            128,
+            &cached_skills,
+            Locale::En,
+            None,
+            ApiProvider::Deepseek,
+        );
         assert!(!hints.iter().any(|hint| hint.name == "/skill search-files"));
         assert!(!hints.iter().any(|hint| hint.name == "/skill my-review"));
     }
@@ -2448,7 +2534,14 @@ mod tests {
             ("search-files".to_string(), "Search files".to_string()),
             ("my-review".to_string(), "Review code".to_string()),
         ];
-        let hints = slash_completion_hints("/skill ", 128, &cached_skills, Locale::En, None);
+        let hints = slash_completion_hints(
+            "/skill ",
+            128,
+            &cached_skills,
+            Locale::En,
+            None,
+            ApiProvider::Deepseek,
+        );
         assert_eq!(hints.len(), 2);
         assert!(hints.iter().any(|hint| hint.name == "/skill search-files"));
         assert!(hints.iter().any(|hint| hint.name == "/skill my-review"));
@@ -2461,10 +2554,45 @@ mod tests {
             ("search-files".to_string(), "Search files".to_string()),
             ("my-review".to_string(), "Review code".to_string()),
         ];
-        let hints = slash_completion_hints("/skill my", 128, &cached_skills, Locale::En, None);
+        let hints = slash_completion_hints(
+            "/skill my",
+            128,
+            &cached_skills,
+            Locale::En,
+            None,
+            ApiProvider::Deepseek,
+        );
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].name, "/skill my-review");
         assert!(hints[0].is_skill);
+    }
+
+    #[test]
+    fn slash_completion_hints_model_deepseek_provider_uses_bare_ids() {
+        let hints =
+            slash_completion_hints("/model", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let names = hints
+            .iter()
+            .map(|hint| hint.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"/model deepseek-v4-pro"));
+        assert!(names.contains(&"/model deepseek-v4-flash"));
+        assert!(!names.contains(&"/model deepseek-ai/deepseek-v4-pro"));
+        assert!(!names.contains(&"/model deepseek/deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn slash_completion_hints_model_provider_uses_provider_specific_ids() {
+        let hints =
+            slash_completion_hints("/model", 128, &[], Locale::En, None, ApiProvider::NvidiaNim);
+        let names = hints
+            .iter()
+            .map(|hint| hint.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"/model deepseek-ai/deepseek-v4-pro"));
+        assert!(!names.contains(&"/model deepseek/deepseek-v4-pro"));
     }
 
     #[test]
@@ -2608,6 +2736,31 @@ mod tests {
     }
 
     #[test]
+    fn composer_border_does_not_render_session_title() {
+        let mut app = create_test_app();
+        app.composer_density = ComposerDensity::Comfortable;
+        app.session_title =
+            Some("hello could you please take a look at deepseek-tui and all changes".to_string());
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
+        let mention_menu_entries = Vec::<String>::new();
+        let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 96,
+            height: 5,
+        };
+        let mut buf = Buffer::empty(area);
+
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+
+        assert!(rendered.contains("Composer"));
+        assert!(!rendered.contains("deepseek-tui"));
+        assert!(!rendered.contains("hello could you"));
+    }
+
+    #[test]
     fn slash_menu_open_locks_composer_height_against_match_count_changes() {
         // Repro for the Windows 10 PowerShell + WSL feedback: typing
         // through a slash command shrinks the matched-entry list, which
@@ -2625,12 +2778,14 @@ mod tests {
                 name: format!("/skill{i}"),
                 description: String::new(),
                 is_skill: false,
+                alias_hint: None,
             })
             .collect();
         let one_match = vec![SlashMenuEntry {
             name: "/skill".to_string(),
             description: String::new(),
             is_skill: false,
+            alias_hint: None,
         }];
         let no_matches = Vec::<SlashMenuEntry>::new();
 

@@ -80,7 +80,7 @@ export function Footer({ locale = "en" }: { locale?: Locale }) {
             <div>
               <div className="font-display text-xl font-semibold">DeepSeek TUI</div>
               <div className="font-cjk text-[0.7rem] text-ink-mute tracking-widest">
-                {isZh ? "深度求索 · 终端智能体" : "深度求索 · 终端代理"}
+                {isZh ? "深度求索 · 终端智能体" : "深度求索 · 终端智能体"}
               </div>
             </div>
           </div>
@@ -98,6 +98,7 @@ export function Footer({ locale = "en" }: { locale?: Locale }) {
               <div className="eyebrow mb-2 text-ink-mute">镜像源 / Mirror</div>
               <div className="flex flex-wrap gap-3 text-xs">
                 {GITEE_ENABLED && <a href="https://gitee.com/Hmbown/deepseek-tui" className="text-indigo hover:underline" target="_blank" rel="noopener">Gitee 镜像</a>}
+                <a href="https://cnb.cool/deepseek-tui.com/DeepSeek-TUI" className="text-indigo hover:underline" target="_blank" rel="noopener">CNB 镜像</a>
                 <a href="https://npmmirror.com/package/deepseek-tui" className="text-indigo hover:underline" target="_blank" rel="noopener">npmmirror</a>
                 <a href="https://mirrors.tuna.tsinghua.edu.cn/help/crates.io-index.html" className="text-indigo hover:underline" target="_blank" rel="noopener">Tuna crates.io</a>
               </div>

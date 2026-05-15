@@ -7,6 +7,285 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Update guidance is clearer on the website.** The homepage and install page
+  now surface `deepseek update` while keeping package-manager update paths
+  visible for Homebrew, npm, and Cargo installs.
+- **README setup docs are current again.** The English, Simplified Chinese,
+  and Japanese READMEs now use the current Docker volume/workspace invocation,
+  document update paths, list the current provider/model switching surface, and
+  send release-specific feature notes back to the changelog.
+
+### Fixed
+
+- **OpenAI-compatible providers receive stricter request bodies.** Fireworks
+  requests now use `reasoning_effort` without the DeepSeek/Anthropic-style
+  top-level `thinking` field, and chat tool schemas no longer include
+  Anthropic-only metadata such as `allowed_callers`, `defer_loading`, or
+  `input_examples` (#1592).
+- **pnpm global installs no longer hang in optional postinstall.** pnpm
+  postinstall now skips install-time binary downloads and leaves the existing
+  runtime downloader to verify or fetch binaries on first run (#1637).
+- **Terminal modes are restored on early TUI exits.** A cleanup guard now
+  restores raw mode, alternate screen, focus events, mouse capture, bracketed
+  paste, keyboard flags, and cursor visibility if startup returns early after
+  terminal initialization (#1593, #1582).
+- **Wrapped OSC 8 links keep their full target.** Long clickable URLs now
+  reopen the original full link target on each wrapped visual chunk instead of
+  exposing truncated hyperlink targets (#1577).
+- **Provider-selected models survive startup and picker reselects.** The
+  `/model` picker now uses live provider model catalogs when available, saved
+  default providers sync into the runtime config before the first request, and
+  reselecting the active provider from the picker keeps the current model
+  instead of falling back to the provider default (#1632).
+- **Windows wheel-as-arrow scrolling works with mouse capture enabled.**
+  `composer_arrows_scroll` now defaults on for Windows terminals even when
+  mouse capture is enabled, so wheel events that arrive as arrow keys scroll the
+  transcript instead of cycling composer history (#1578).
+- **Plain Windows PowerShell / ConHost uses calmer rendering.** Unmarked
+  legacy Windows console hosts now automatically enable low-motion rendering,
+  disable fancy animations, and resolve `synchronized_output = "auto"` to off
+  so streaming redraws do not overlap or visibly flicker (#1590).
+
+### Thanks
+
+Thanks to **DC ([@duanchao-lab](https://github.com/duanchao-lab))** for the
+terminal cleanup-guard idea harvested from #1630, and **imkingjh999
+([@imkingjh999](https://github.com/imkingjh999))** for the provider/model
+switching fixes harvested from #1642. Thanks to **Photo
+([@eng2007](https://github.com/eng2007))** for the provider-aware `/model`
+picker catalog work harvested from #1201. Thanks to
+**[@kunpeng-ai-lab](https://github.com/kunpeng-ai-lab)** for the Windows
+composer scroll fix harvested from #1578, and **WuMing
+([@asdfg314284230](https://github.com/asdfg314284230))** for the Windows
+PowerShell flicker fix harvested from #1591.
+
+## [0.8.37] - 2026-05-14
+
+### Added
+
+- **Tencent Lighthouse + Feishu/Lark bridge setup.** Added a `/opt/whalebro`
+  Lighthouse runbook, systemd deploy assets, a long-connection Feishu/Lark
+  bridge, a bridge config validator, and a VPS doctor for runtime, Node,
+  binaries, env, systemd, and localhost health checks.
+- **Tencent Cloud remote-first onboarding.** Documented the CNB + Lighthouse +
+  Feishu/Lark + optional EdgeOne teaching path and added non-active CNB deploy
+  templates for a future Lighthouse deploy button. Feishu/Lighthouse branches
+  are now mirrored to CNB for Tencent-first bootstrap.
+- **Homebrew tap automation is release-gated.** The release workflow can update
+  `Hmbown/homebrew-deepseek-tui` from the checksum manifest when a tap token is
+  configured, and skips cleanly before downloading release assets when no tap
+  token exists.
+
+### Changed
+
+- **Bing is the default `web_search` backend.** DuckDuckGo remains selectable
+  with `[search] provider = "duckduckgo"` and keeps its Bing fallback path.
+
+### Fixed
+
+- **First-run onboarding stays usable without an API key.** Missing-key startup
+  no longer aborts the TUI before onboarding can collect provider settings.
+- **Streamable HTTP MCP sessions keep their server-issued session ID.** Custom
+  headers also apply to GET preflight requests, fixing authenticated MCP
+  servers that require both.
+- **DeepSeek model completions use canonical IDs.** Alias completions now
+  resolve to stable DeepSeek model names before being written to config.
+- **Terminal and child-process reliability is tighter.** Signal shutdown now
+  restores the terminal, child tasks preserve proxy environment variables, and
+  Windows Enter / CSI-u input handling avoids the prior event mismatch.
+- **Long terminal text wraps instead of overflowing.** Streaming output, diff
+  rendering, and the pager now hard-wrap overlong no-whitespace and CJK runs.
+- **Release and platform edges are safer.** The TUI no longer trips the Windows
+  Instant-underflow test path, unsupported desktop targets compile the external
+  URL opener, and legacy DeepSeek CN provider aliases deserialize to the
+  canonical DeepSeek provider.
+- **Footer diagnostics are less cryptic.** Prefix-cache stability is no longer
+  shown in the default footer, and the opt-in `/statusline` chip now says
+  `cache prefix 100%` instead of the ambiguous `P 100%`.
+- **Feishu/Lark bridge dependency installs are locked and audited.** The
+  bridge now ships a package lock, installs with `npm ci` on Lighthouse when
+  available, and overrides the Lark SDK's transitive `axios` dependency to a
+  patched line.
+- **China-friendly update fallback.** `deepseek update` now supports mirrored
+  release assets through `DEEPSEEK_TUI_RELEASE_BASE_URL` plus
+  `DEEPSEEK_TUI_VERSION`, and its network-failure hints point users behind
+  GitHub-blocking networks to the CNB `cargo install --git` path for both
+  shipped binaries.
+- **CNB is the default Tencent release-candidate mirror.** The CNB sync
+  workflow now mirrors Feishu/Lighthouse release branches, so Tencent
+  Lighthouse bootstrap can use CNB before the release branch merges.
+
+### Thanks
+
+Thanks to **ZzzPL ([@Oliver-ZPLiu](https://github.com/Oliver-ZPLiu))** for
+the MCP Streamable HTTP and Homebrew automation fixes (#1643, #1631),
+**Reid ([@reidliu41](https://github.com/reidliu41))** for CI, streaming wrap,
+and model-completion fixes (#1603, #1628, #1601), **MidoriKurage
+([@mdrkrg](https://github.com/mdrkrg))** for the onboarding crash fix (#1598),
+**Gordon ([@gordonlu](https://github.com/gordonlu))** for the Windows Enter /
+CSI-u fix (#1612), **Aitensa ([@Aitensa](https://github.com/Aitensa))** for
+the CJK diff/pager wrap fix (#1622), **qiyan233
+([@qiyan233](https://github.com/qiyan233))** for legacy DeepSeek CN provider
+aliases (#1645), **jieshu666 ([@jieshu666](https://github.com/jieshu666))**
+for the repaint-flicker reduction (#1563), **Vishnu
+([@Vishnu1837](https://github.com/Vishnu1837))** for terminal restoration on
+signals (#1586), and **axobase001
+([@axobase001](https://github.com/axobase001))** for proxy environment
+preservation in child tasks (#1608).
+
+## [0.8.36] - 2026-05-14
+
+### Added
+
+- **The right sidebar can be hidden for copy-friendly terminals.**
+  `sidebar_focus = "hidden"` (or `Ctrl+Alt+0` for the current session) removes
+  the Work/Tasks/Agents/Context rail so raw terminal selection cannot copy
+  sidebar borders alongside transcript text.
+
+### Changed
+
+- **Sub-agent completion handoffs are leaner and more cache-friendly.**
+  Internal `<deepseek:subagent.done>` sentinels now point to the preceding
+  human summary line instead of duplicating the summary, elapsed time, and
+  step count inside JSON sent to the parent model.
+- **Prefix stability is visible beside cache telemetry by default.** The
+  footer now includes the prefix-stability chip in the default status layout,
+  and low last-request cache hit rates are no longer colored as hard errors
+  when the system/tool prefix itself is stable.
+- **RLM batch helpers now require an explicit independence assertion.**
+  `sub_query_batch`, `sub_query_map`, and low-level `*_batched` helpers refuse
+  dependency-unsafe parallel fanout unless callers pass
+  `dependency_mode="independent"`, and RLM now exposes `sub_query_sequence`
+  for A-to-B dependent work.
+
+## [0.8.35] - 2026-05-13
+
+A post-0.8.34 cleanup release focused on prompt hygiene, context-pressure
+guidance, and keeping the next release branch clearly separated from the
+already-published v0.8.34 tag.
+
+> **Note on v0.8.34 contributor credits:** Horace Liu ([@liuhq](https://github.com/liuhq))
+> contributed Nix package support and install documentation in the v0.8.34
+> cycle but was inadvertently omitted from that release's changelog. The
+> README contributor list and this note correct the record.
+
+### Changed
+
+- **First-turn prompt context is leaner and easier to audit.** The
+  generated project context pack now ignores hidden tool/cache state,
+  balances top-level directories before descending, and `/context`
+  shows named prompt layers instead of a single opaque system blob.
+- **Model-visible prompt policy de-conflicted.** The base and mode
+  prompts no longer forbid useful `deepseek` CLI diagnostics, no
+  longer require checklists for simple one-step work, and align
+  long-session compaction guidance around the 60% suggestion threshold.
+- **Context-pressure guidance now has one split rule.** Manual
+  `/compact` suggestions start around 60% during sustained work, while
+  automatic replacement compaction remains an opt-in hard guardrail near
+  80% so DeepSeek V4 prefix-cache economics stay intact.
+- **The Tasks sidebar now ages out stale live-tool noise.** Completed
+  active tool rows linger briefly and then leave the right rail; very old
+  running shell rows collapse to a single row instead of occupying the
+  whole Tasks panel.
+
+### Fixed
+
+- **`auto_compact` settings help now reports the real default**, which
+  has been off since v0.8.11 to avoid unnecessary cache-prefix rewrites.
+
+## [0.8.34] - 2026-05-13
+
+A polish, terminal-protocol, and internal-cleanup release. The model-facing
+surface is stable; this cycle focused on prefix-cache stability metrics,
+broader terminal protocol coverage, bundled skills, and shrinking the
+mega-files that had grown around the agent loop and TUI.
+
+### Added
+
+- **Prefix-cache stability tracking.** A footer chip surfaces how stable
+  the cached prefix has been across recent turns (inspired by Reasonix),
+  so users can spot cache-busting edits before cost climbs.
+- **Bundled DeepSeek-native workflow skills.** A starter set of skills
+  ships in-binary so a fresh install has a usable `/skills` catalog
+  without external assets.
+- **Native Kitty + Ghostty notification protocols.** `OSC 99` (Kitty)
+  and `OSC 777` (Ghostty) are now first-class alongside the existing
+  desktop notification fallback.
+- **Theme picker with more presets.** Catppuccin, Tokyo Night, Dracula,
+  and Gruvbox join the built-in palette set; `/theme` now shows a
+  live picker.
+- **Chunked parallel-safe tool execution.** The engine batches
+  side-effect-free tool calls into a chunked dispatch so independent
+  reads/searches finish in one turn instead of serialising round-trip
+  by round-trip.
+- **Cancel-all shell jobs.** A single action stops every running
+  background shell command instead of cancelling them one-by-one.
+- **`edit_file` tolerates typographic punctuation drift.** When the
+  exact-match and leading-whitespace-fuzzy passes both fail and
+  `fuzz: true` is set, the tool retries with smart quotes (`"`/`"` →
+  `"`, `'`/`'` → `'`), en/em-dashes (`–`/`—` → `-`), and non-breaking
+  spaces (U+00A0 → space) normalized to ASCII. Catches the copy-paste
+  failure mode where a browser or chat client substituted Unicode
+  punctuation for the ASCII the file actually contains.
+
+### Changed
+
+- **`crates/tui/src/tui/ui.rs` split into focused modules.** The
+  former 10k-line single-file TUI dispatcher is decomposed into smaller
+  modules with clearer responsibilities so reviewing a UI change does
+  not require holding the entire surface in head.
+- **`crates/tui/src/core/engine.rs` reduced.** Helper clusters moved
+  into the existing `core/engine/` submodule directory next to the
+  turn loop and tool execution code, making the agent-loop core
+  easier to read end-to-end.
+- **Structured tracing on tool dispatch.** Tool entry, exit, duration,
+  and result/error are emitted through `tracing` events so
+  `RUST_LOG=engine.tool_execution=debug` produces a coherent timeline
+  instead of scattered ad-hoc prints.
+- **`/init` updates `AGENTS.md` in place** instead of refusing when
+  the file already exists, so adding new project guidance does not
+  require manual stitching.
+- **Reasoning tokens included in cost calculations**, and the cost
+  display auto-switches to CNY when the session locale is `zh-Hans`.
+- **Stale repo-root development docs removed.** `TAKEOVER_PROMPT.md`
+  (v0.8.6 era), `PROMPT_ANALYSIS.md`, and the redundant
+  `DEPENDENCY_GRAPH.md` no longer ship in releases; `docs/ARCHITECTURE.md`
+  remains the canonical crate-layout reference.
+
+### Fixed
+
+- **Auth keys checked against the saved provider on startup**, so a
+  stored DeepSeek key is no longer rejected after switching providers
+  mid-session.
+- **Auto router skipped for decisive local routes**, removing an
+  extra model round-trip on prompts the dispatcher can route directly.
+- **Reasoning content stripped for generic providers** that do not
+  understand the `reasoning_content` field, preventing HTTP 400s when
+  pointing at an OpenAI-compatible gateway that lacks DeepSeek
+  thinking semantics.
+- **`FocusGained` debounced** so terminals (Tabby) that emit rapid
+  focus events no longer trigger a repaint flicker loop.
+- **MCP HTTP transport defaults `Accept: application/json,
+  text/event-stream`** and persists `Mcp-Session-Id` across requests,
+  matching the spec for resumable streams.
+- **Shell output tail preserved when truncating**, so the last lines
+  of a long command output (usually the error trailer) survive the
+  in-transcript summary.
+- **Prefix cache preserved while pruning tool results.** Old
+  side-effect tool payloads no longer invalidate the prefix that
+  the next turn would otherwise reuse.
+- **Review sub-agents prevented from spawning further sub-agents**
+  (#1489), keeping recursive depth bounded.
+- **Help overlay closes cleanly** and repaints without a stale frame.
+- **Pinyin `/skills` alias dispatched correctly** so Chinese-locale
+  users reach the same surface.
+- **VTE flicker terminals get reduced motion** by default to avoid
+  thrashing on terminals that mishandle frequent partial redraws.
+- **Composer border no longer shows the derived session title**, keeping
+  the composer chrome reserved for editor and mode state.
+
 ## [0.8.33] - 2026-05-12
 
 A sub-agent and RLM renovation release. The model-facing delegation
@@ -3979,7 +4258,11 @@ Welcome — and thank you.
 - Hooks system and config profiles
 - Example skills and launch assets
 
-[Unreleased]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.8.33...HEAD
+[Unreleased]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.8.37...HEAD
+[0.8.37]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.8.36...v0.8.37
+[0.8.36]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.8.35...v0.8.36
+[0.8.35]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.8.34...v0.8.35
+[0.8.34]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.8.33...v0.8.34
 [0.8.33]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.8.32...v0.8.33
 [0.8.32]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.8.31...v0.8.32
 [0.8.31]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.8.30...v0.8.31
