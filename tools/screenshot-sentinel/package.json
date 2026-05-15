@@ -1,0 +1,14 @@
+{
+  "name": "flexible-screenshot-sentinel",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "sentinel": "node media-bridge.js",
+    "sentinel:quiet": "node media-bridge.js --quiet"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.3",
+    "clipboardy": "^4.0.0"
+  }
+}

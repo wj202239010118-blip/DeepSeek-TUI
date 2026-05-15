@@ -1,0 +1,48 @@
+{
+    "wx_cli": {
+        "exe_path": "",
+        "daemon_auto_start": true
+    },
+    "wechat": {
+        "process_name": "Weixin.exe",
+        "window_title_contains": "微信",
+        "window_class_contains": "WeChatMainWndForPC"
+    },
+    "anti_detect": {
+        "mouse": {
+            "bezier_waypoints": [3, 6],
+            "speed_min": 400,
+            "speed_max": 1200,
+            "overshoot_pct": 0.15,
+            "overshoot_distance": [5, 20]
+        },
+        "window": {
+            "focus_delay_ms": [200, 800],
+            "post_click_pause_ms": [100, 400]
+        },
+        "delay": {
+            "action_interval_ms": [500, 3000],
+            "typing_delay_ms": [80, 250],
+            "think_time_ms": [2000, 8000]
+        },
+        "sleep": {
+            "enabled": true,
+            "night_start": "23:00",
+            "night_end": "07:00",
+            "sleep_duration_hours": [6, 8],
+            "weekend_sleep_in_hours": [0, 2]
+        },
+        "template": {
+            "synonym_rate": 0.3,
+            "emoji_rate": 0.4,
+            "tone_variants": ["casual", "enthusiastic", "neutral"],
+            "default_tone": "casual"
+        }
+    },
+    "safety": {
+        "max_daily_moments": 3,
+        "max_daily_messages": 50,
+        "min_interval_between_moments_minutes": 120,
+        "cooldown_after_flag_minutes": 1440
+    }
+}

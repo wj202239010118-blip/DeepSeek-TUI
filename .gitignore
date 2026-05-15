@@ -91,3 +91,14 @@ apps/
 
 # Maintainer-internal design notes (trade-secret material, never published)
 .private/
+
+# ---- Tools runtime artifacts ----
+tools/*/node_modules/
+tools/*/__pycache__/
+tools/*/*.pyc
+tools/*/*.pyo
+tools/*/screenshots/
+tools/*/feishu_uploads/
+tools/wx-bot/config.json
+tools/page-agent-bridge/.npm/
+tools/screenshot-sentinel/.npm/

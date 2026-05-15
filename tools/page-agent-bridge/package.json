@@ -1,0 +1,17 @@
+{
+  "name": "deepseek-tui-page-agent-bridge",
+  "private": true,
+  "version": "0.8.0",
+  "type": "module",
+  "description": "Page Agent MCP bridge for DeepSeek TUI — browser control via Chrome extension",
+  "scripts": {
+    "start": "node deepseek-bridge.js",
+    "port-manager": "node port-manager.js",
+    "session": "node session-launcher.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ws": "^8.20.0",
+    "zod": "^4.3.6"
+  }
+}
