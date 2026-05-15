@@ -397,6 +397,16 @@ pub fn load_project_context_with_parents(workspace: &Path) -> ProjectContext {
     load_project_context_with_parents_and_home(workspace, dirs::home_dir().as_deref())
 }
 
+/// Async wrapper that runs the directory crawl in `spawn_blocking` to avoid
+/// blocking the tokio worker thread on Windows filesystem operations (P3).
+/// The workspace path is cloned so it can be moved into the blocking closure.
+pub async fn load_project_context_async(workspace: std::path::PathBuf) -> ProjectContext {
+    let ws = workspace.clone();
+    tokio::task::spawn_blocking(move || load_project_context_with_parents(&ws))
+        .await
+        .unwrap_or_else(|_| ProjectContext::empty(workspace))
+}
+
 fn load_project_context_with_parents_and_home(
     workspace: &Path,
     home_dir: Option<&Path>,

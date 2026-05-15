@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use std::thread;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -125,29 +126,29 @@ struct SessionIndexEntry {
     rollout_path: Option<PathBuf>,
 }
 
+const MAX_BUSY_RETRIES: u32 = 5;
+const BUSY_RETRY_BASE_MS: u64 = 50;
+const BUSY_RETRY_MAX_MS: u64 = 500;
+
 #[derive(Debug, Clone)]
 pub struct StateStore {
     db_path: PathBuf,
-    session_index_path: PathBuf,
 }
 
 impl StateStore {
+    /// Open (or create) the state database.
+    ///
+    /// Enables WAL journal mode for safe multi-process concurrent access.
     pub fn open(path: Option<PathBuf>) -> Result<Self> {
         let db_path = path.unwrap_or_else(default_state_db_path);
-        let session_index_path = db_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("session_index.jsonl");
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create state directory {}", parent.display())
             })?;
         }
-        let store = Self {
-            db_path,
-            session_index_path,
-        };
+        let store = Self { db_path };
         store.init_schema()?;
+        store.apply_pragmas()?;
         Ok(store)
     }
 
@@ -156,8 +157,54 @@ impl StateStore {
     }
 
     fn conn(&self) -> Result<Connection> {
-        Connection::open(&self.db_path)
-            .with_context(|| format!("failed to open state db {}", self.db_path.display()))
+        let conn = Connection::open(&self.db_path)
+            .with_context(|| format!("failed to open state db {}", self.db_path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;
+             PRAGMA foreign_keys=ON;
+             PRAGMA wal_autocheckpoint=1000;",
+        )
+        .with_context(|| "failed to set WAL pragmas")?;
+        Ok(conn)
+    }
+
+    fn apply_pragmas(&self) -> Result<()> {
+        let conn = Connection::open(&self.db_path)
+            .with_context(|| format!("failed to open state db for pragmas {}", self.db_path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;
+             PRAGMA foreign_keys=ON;
+             PRAGMA wal_autocheckpoint=1000;",
+        )
+        .with_context(|| "failed to set WAL pragmas")?;
+        Ok(())
+    }
+
+    fn with_busy_retry<T, F>(&self, mut f: F) -> Result<T>
+    where
+        F: FnMut() -> Result<T>,
+    {
+        let mut attempts = 0u32;
+        loop {
+            match f() {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    let msg = format!("{err}");
+                    let is_busy = msg.contains("database is locked");
+                    if !is_busy || attempts >= MAX_BUSY_RETRIES {
+                        return Err(err);
+                    }
+                    attempts += 1;
+                    let base = (BUSY_RETRY_BASE_MS * 2u64.pow(attempts - 1)).min(BUSY_RETRY_MAX_MS);
+                    let jitter = (Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64) % (base / 2 + 1);
+                    thread::sleep(Duration::from_millis(base + jitter));
+                }
+            }
+        }
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -232,9 +279,64 @@ impl StateStore {
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS session_index (
+                thread_id TEXT PRIMARY KEY,
+                thread_name TEXT,
+                updated_at INTEGER NOT NULL,
+                rollout_path TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_index_updated_at ON session_index(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_session_index_name ON session_index(thread_name);
             "#,
         )
         .context("failed to initialize thread schema")?;
+
+        self.migrate_session_index_jsonl()?;
+        Ok(())
+    }
+
+    fn migrate_session_index_jsonl(&self) -> Result<()> {
+        let jsonl = self.db_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("session_index.jsonl");
+        if !jsonl.exists() {
+            return Ok(());
+        }
+        let conn = self.conn()?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_index", [], |row| row.get(0))
+            .unwrap_or(0);
+        if count > 0 {
+            return Ok(());
+        }
+        let content = match fs::read_to_string(&jsonl) {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        let mut inserted = 0usize;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(line) {
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO session_index (thread_id, thread_name, updated_at, rollout_path) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        entry.thread_id,
+                        entry.thread_name,
+                        entry.updated_at,
+                        entry.rollout_path.map(|p| p.display().to_string()),
+                    ],
+                );
+                inserted += 1;
+            }
+        }
+        if inserted > 0 {
+            let _ = fs::rename(&jsonl, jsonl.with_extension("jsonl.bak"));
+        }
         Ok(())
     }
 
@@ -250,46 +352,44 @@ impl StateStore {
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15, ?16, ?17,
                 ?18, ?19, ?20, ?21
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                rollout_path=excluded.rollout_path,
-                preview=excluded.preview,
-                ephemeral=excluded.ephemeral,
-                model_provider=excluded.model_provider,
-                created_at=excluded.created_at,
-                updated_at=excluded.updated_at,
-                status=excluded.status,
-                path=excluded.path,
-                cwd=excluded.cwd,
-                cli_version=excluded.cli_version,
-                source=excluded.source,
-                title=excluded.title,
-                sandbox_policy=excluded.sandbox_policy,
-                approval_mode=excluded.approval_mode,
-                archived=excluded.archived,
-                archived_at=excluded.archived_at,
-                git_sha=excluded.git_sha,
-                git_branch=excluded.git_branch,
-                git_origin_url=excluded.git_origin_url,
-                memory_mode=excluded.memory_mode
+            ) ON CONFLICT(id) DO UPDATE SET
+                rollout_path = excluded.rollout_path,
+                preview = excluded.preview,
+                ephemeral = excluded.ephemeral,
+                model_provider = excluded.model_provider,
+                updated_at = excluded.updated_at,
+                status = excluded.status,
+                path = excluded.path,
+                cwd = excluded.cwd,
+                cli_version = excluded.cli_version,
+                source = excluded.source,
+                title = excluded.title,
+                sandbox_policy = excluded.sandbox_policy,
+                approval_mode = excluded.approval_mode,
+                archived = excluded.archived,
+                archived_at = excluded.archived_at,
+                git_sha = excluded.git_sha,
+                git_branch = excluded.git_branch,
+                git_origin_url = excluded.git_origin_url,
+                memory_mode = excluded.memory_mode
             "#,
             params![
                 thread.id,
-                path_to_opt_string(thread.rollout_path.as_deref()),
+                thread.rollout_path.as_ref().map(|p| p.display().to_string()),
                 thread.preview,
-                bool_to_i64(thread.ephemeral),
+                thread.ephemeral,
                 thread.model_provider,
                 thread.created_at,
                 thread.updated_at,
                 thread_status_to_str(&thread.status),
-                path_to_opt_string(thread.path.as_deref()),
+                thread.path.as_ref().map(|p| p.display().to_string()),
                 thread.cwd.display().to_string(),
                 thread.cli_version,
                 session_source_to_str(&thread.source),
                 thread.name,
                 thread.sandbox_policy,
                 thread.approval_mode,
-                bool_to_i64(thread.archived),
+                thread.archived,
                 thread.archived_at,
                 thread.git_sha,
                 thread.git_branch,
@@ -297,445 +397,218 @@ impl StateStore {
                 thread.memory_mode,
             ],
         )
-        .context("failed to upsert thread metadata")?;
+        .context("failed to upsert thread")?;
+        Ok(())
+    }
 
-        self.append_thread_name(
-            &thread.id,
-            thread.name.clone(),
-            thread.updated_at,
-            thread.rollout_path.clone(),
+    pub fn list_threads(&self, filters: &ThreadListFilters) -> Result<Vec<ThreadMetadata>> {
+        let conn = self.conn()?;
+        let query = if filters.include_archived {
+            "SELECT * FROM threads ORDER BY updated_at DESC".to_string()
+        } else {
+            "SELECT * FROM threads WHERE archived = 0 ORDER BY updated_at DESC".to_string()
+        };
+        let query = if let Some(limit) = filters.limit {
+            format!("{query} LIMIT {limit}")
+        } else {
+            query
+        };
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map([], |row| row_to_thread(row))?;
+        let mut threads = Vec::new();
+        for row in rows {
+            threads.push(row?);
+        }
+        Ok(threads)
+    }
+
+    pub fn get_thread(&self, thread_id: &str) -> Result<Option<ThreadMetadata>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT * FROM threads WHERE id = ?1",
+            params![thread_id],
+            |row| row_to_thread(row),
+        )
+        .optional()
+        .context("failed to get thread")
+    }
+
+    pub fn delete_thread(&self, thread_id: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM threads WHERE id = ?1", params![thread_id])?;
+        conn.execute("DELETE FROM session_index WHERE thread_id = ?1", params![thread_id])?;
+        Ok(())
+    }
+
+    pub fn archive_thread(&self, thread_id: &str) -> Result<()> {
+        let conn = self.conn()?;
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "UPDATE threads SET archived = 1, archived_at = ?1, updated_at = ?1 WHERE id = ?2",
+            params![now, thread_id],
         )?;
         Ok(())
     }
 
-    pub fn get_thread(&self, id: &str) -> Result<Option<ThreadMetadata>> {
+    pub fn unarchive_thread(&self, thread_id: &str) -> Result<()> {
         let conn = self.conn()?;
-        conn.query_row(
-            r#"
-            SELECT id, rollout_path, preview, ephemeral, model_provider, created_at, updated_at, status, path, cwd,
-                   cli_version, source, title, sandbox_policy, approval_mode, archived, archived_at,
-                   git_sha, git_branch, git_origin_url, memory_mode
-            FROM threads
-            WHERE id = ?1
-            "#,
-            params![id],
-            row_to_thread,
-        )
-        .optional()
-        .context("failed to read thread")
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "UPDATE threads SET archived = 0, archived_at = NULL, updated_at = ?1 WHERE id = ?2",
+            params![now, thread_id],
+        )?;
+        Ok(())
     }
 
-    pub fn list_threads(&self, filters: ThreadListFilters) -> Result<Vec<ThreadMetadata>> {
-        let conn = self.conn()?;
-        let sql = if filters.include_archived {
-            "SELECT id, rollout_path, preview, ephemeral, model_provider, created_at, updated_at, status, path, cwd, cli_version, source, title, sandbox_policy, approval_mode, archived, archived_at, git_sha, git_branch, git_origin_url, memory_mode FROM threads ORDER BY updated_at DESC LIMIT ?1"
-        } else {
-            "SELECT id, rollout_path, preview, ephemeral, model_provider, created_at, updated_at, status, path, cwd, cli_version, source, title, sandbox_policy, approval_mode, archived, archived_at, git_sha, git_branch, git_origin_url, memory_mode FROM threads WHERE archived = 0 ORDER BY updated_at DESC LIMIT ?1"
-        };
-
-        let mut stmt = conn.prepare(sql).context("failed to prepare list query")?;
-        let limit = i64::try_from(filters.limit.unwrap_or(50)).unwrap_or(50);
-        let mut rows = stmt
-            .query(params![limit])
-            .context("failed to query threads")?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().context("failed to iterate thread rows")? {
-            out.push(row_to_thread(row)?);
-        }
-        Ok(out)
-    }
-
-    pub fn mark_archived(&self, id: &str) -> Result<()> {
+    pub fn upsert_dynamic_tool(&self, thread_id: &str, tool: &DynamicToolRecord) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            "UPDATE threads SET archived = 1, archived_at = ?2, status = ?3 WHERE id = ?1",
+            "INSERT OR REPLACE INTO thread_dynamic_tools (thread_id, position, name, description, input_schema) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                id,
-                Utc::now().timestamp(),
-                thread_status_to_str(&ThreadStatus::Archived)
+                thread_id,
+                tool.position,
+                tool.name,
+                tool.description,
+                tool.input_schema.to_string(),
             ],
-        )
-        .context("failed to archive thread")?;
+        )?;
         Ok(())
     }
 
-    pub fn mark_unarchived(&self, id: &str) -> Result<()> {
+    pub fn list_dynamic_tools(&self, thread_id: &str) -> Result<Vec<DynamicToolRecord>> {
         let conn = self.conn()?;
-        conn.execute(
-            "UPDATE threads SET archived = 0, archived_at = NULL WHERE id = ?1",
-            params![id],
-        )
-        .context("failed to unarchive thread")?;
-        Ok(())
-    }
-
-    pub fn delete_thread(&self, id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute("DELETE FROM threads WHERE id = ?1", params![id])
-            .context("failed to delete thread")?;
-        Ok(())
-    }
-
-    pub fn set_thread_memory_mode(&self, id: &str, mode: Option<&str>) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "UPDATE threads SET memory_mode = ?2 WHERE id = ?1",
-            params![id, mode],
-        )
-        .context("failed to update thread memory mode")?;
-        Ok(())
-    }
-
-    pub fn get_thread_memory_mode(&self, id: &str) -> Result<Option<String>> {
-        let conn = self.conn()?;
-        conn.query_row(
-            "SELECT memory_mode FROM threads WHERE id = ?1",
-            params![id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .context("failed to read thread memory mode")
-        .map(Option::flatten)
-    }
-
-    pub fn persist_dynamic_tools(
-        &self,
-        thread_id: &str,
-        tools: &[DynamicToolRecord],
-    ) -> Result<()> {
-        let mut conn = self.conn()?;
-        let tx = conn
-            .transaction()
-            .context("failed to begin dynamic tools transaction")?;
-        tx.execute(
-            "DELETE FROM thread_dynamic_tools WHERE thread_id = ?1",
-            params![thread_id],
-        )
-        .context("failed to clear dynamic tools")?;
-        for tool in tools {
-            tx.execute(
-                "INSERT INTO thread_dynamic_tools(thread_id, position, name, description, input_schema) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    thread_id,
-                    tool.position,
-                    tool.name,
-                    tool.description,
-                    tool.input_schema.to_string()
-                ],
-            )
-            .with_context(|| format!("failed to persist dynamic tool {}", tool.name))?;
+        let mut stmt = conn.prepare(
+            "SELECT position, name, description, input_schema FROM thread_dynamic_tools WHERE thread_id = ?1 ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |row| {
+            let input_schema: String = row.get(3)?;
+            Ok(DynamicToolRecord {
+                position: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                input_schema: serde_json::from_str(&input_schema).unwrap_or_default(),
+            })
+        })?;
+        let mut tools = Vec::new();
+        for row in rows {
+            tools.push(row?);
         }
-        tx.commit().context("failed to commit dynamic tools")?;
-        Ok(())
+        Ok(tools)
     }
 
-    pub fn get_dynamic_tools(&self, thread_id: &str) -> Result<Vec<DynamicToolRecord>> {
+    pub fn insert_message(&self, msg: &MessageRecord) -> Result<i64> {
         let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT position, name, description, input_schema FROM thread_dynamic_tools WHERE thread_id = ?1 ORDER BY position ASC",
-            )
-            .context("failed to prepare get dynamic tools query")?;
-        let mut rows = stmt
-            .query(params![thread_id])
-            .context("failed to query dynamic tools")?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().context("failed to iterate dynamic tools")? {
-            let input_schema_raw: String =
-                row.get(3).context("failed to read tool input schema")?;
-            let input_schema: Value =
-                serde_json::from_str(&input_schema_raw).with_context(|| {
-                    format!("failed to parse input schema for dynamic tool in thread {thread_id}")
-                })?;
-            out.push(DynamicToolRecord {
-                position: row.get(0).context("failed to read tool position")?,
-                name: row.get(1).context("failed to read tool name")?,
-                description: row.get(2).context("failed to read tool description")?,
-                input_schema,
-            });
-        }
-        Ok(out)
-    }
-
-    pub fn append_message(
-        &self,
-        thread_id: &str,
-        role: &str,
-        content: &str,
-        item: Option<Value>,
-    ) -> Result<i64> {
-        let conn = self.conn()?;
-        let created_at = Utc::now().timestamp();
-        let item_json = item
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .context("failed to serialize message item payload")?;
         conn.execute(
-            "INSERT INTO messages(thread_id, role, content, item_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![thread_id, role, content, item_json, created_at],
-        )
-        .with_context(|| format!("failed to append message for thread {thread_id}"))?;
+            "INSERT INTO messages (thread_id, role, content, item_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                msg.thread_id,
+                msg.role,
+                msg.content,
+                msg.item.as_ref().map(|v| v.to_string()),
+                msg.created_at,
+            ],
+        )?;
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn list_messages(
-        &self,
-        thread_id: &str,
-        limit: Option<usize>,
-    ) -> Result<Vec<MessageRecord>> {
+    pub fn list_messages(&self, thread_id: &str) -> Result<Vec<MessageRecord>> {
         let conn = self.conn()?;
-        let limit = i64::try_from(limit.unwrap_or(500)).unwrap_or(500);
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, thread_id, role, content, item_json, created_at FROM messages WHERE thread_id = ?1 ORDER BY created_at ASC LIMIT ?2",
-            )
-            .context("failed to prepare message listing query")?;
-        let mut rows = stmt
-            .query(params![thread_id, limit])
-            .with_context(|| format!("failed to list messages for thread {thread_id}"))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().context("failed to iterate message rows")? {
-            let item_json: Option<String> = row.get(4).context("failed to read item json")?;
-            let item = item_json
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()
-                .with_context(|| {
-                    format!("failed to parse message item json in thread {thread_id}")
-                })?;
-            out.push(MessageRecord {
-                id: row.get(0).context("failed to read message id")?,
-                thread_id: row.get(1).context("failed to read message thread id")?,
-                role: row.get(2).context("failed to read message role")?,
-                content: row.get(3).context("failed to read message content")?,
-                item,
-                created_at: row.get(5).context("failed to read message timestamp")?,
-            });
-        }
-        Ok(out)
-    }
-
-    pub fn clear_messages(&self, thread_id: &str) -> Result<usize> {
-        let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM messages WHERE thread_id = ?1",
-            params![thread_id],
-        )
-        .with_context(|| format!("failed to clear messages for thread {thread_id}"))
-    }
-
-    pub fn save_checkpoint(
-        &self,
-        thread_id: &str,
-        checkpoint_id: &str,
-        state: &Value,
-    ) -> Result<()> {
-        let conn = self.conn()?;
-        let state_json =
-            serde_json::to_string(state).context("failed to encode checkpoint state")?;
-        conn.execute(
-            r#"
-            INSERT INTO checkpoints(thread_id, checkpoint_id, state_json, created_at)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(thread_id, checkpoint_id) DO UPDATE SET
-                state_json = excluded.state_json,
-                created_at = excluded.created_at
-            "#,
-            params![thread_id, checkpoint_id, state_json, Utc::now().timestamp()],
-        )
-        .with_context(|| {
-            format!("failed to save checkpoint {checkpoint_id} for thread {thread_id}")
+        let mut stmt = conn.prepare(
+            "SELECT id, thread_id, role, content, item_json, created_at FROM messages WHERE thread_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |row| {
+            let item_json: Option<String> = row.get(4)?;
+            Ok(MessageRecord {
+                id: row.get(0)?,
+                thread_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                item: item_json.and_then(|s| serde_json::from_str(&s).ok()),
+                created_at: row.get(5)?,
+            })
         })?;
+        let mut msgs = Vec::new();
+        for row in rows {
+            msgs.push(row?);
+        }
+        Ok(msgs)
+    }
+
+    pub fn save_checkpoint(&self, record: &CheckpointRecord) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO checkpoints (thread_id, checkpoint_id, state_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                record.thread_id,
+                record.checkpoint_id,
+                record.state.to_string(),
+                record.created_at,
+            ],
+        )?;
         Ok(())
     }
 
-    pub fn load_checkpoint(
-        &self,
-        thread_id: &str,
-        checkpoint_id: Option<&str>,
-    ) -> Result<Option<CheckpointRecord>> {
+    pub fn load_checkpoint(&self, thread_id: &str) -> Result<Option<CheckpointRecord>> {
         let conn = self.conn()?;
-        if let Some(checkpoint_id) = checkpoint_id {
-            let row = conn
-                .query_row(
-                    "SELECT thread_id, checkpoint_id, state_json, created_at FROM checkpoints WHERE thread_id = ?1 AND checkpoint_id = ?2",
-                    params![thread_id, checkpoint_id],
-                    |row| {
-                        let state_json: String = row.get(2)?;
-                        let state = serde_json::from_str(&state_json).unwrap_or(Value::Null);
-                        Ok(CheckpointRecord {
-                            thread_id: row.get(0)?,
-                            checkpoint_id: row.get(1)?,
-                            state,
-                            created_at: row.get(3)?,
-                        })
-                    },
-                )
-                .optional()
-                .with_context(|| {
-                    format!("failed to load checkpoint {checkpoint_id} for thread {thread_id}")
-                })?;
-            return Ok(row);
-        }
-
         conn.query_row(
             "SELECT thread_id, checkpoint_id, state_json, created_at FROM checkpoints WHERE thread_id = ?1 ORDER BY created_at DESC LIMIT 1",
             params![thread_id],
             |row| {
-                let state_json: String = row.get(2)?;
-                let state = serde_json::from_str(&state_json).unwrap_or(Value::Null);
+                let state_str: String = row.get(2)?;
                 Ok(CheckpointRecord {
                     thread_id: row.get(0)?,
                     checkpoint_id: row.get(1)?,
-                    state,
+                    state: serde_json::from_str(&state_str).unwrap_or_default(),
                     created_at: row.get(3)?,
                 })
             },
         )
         .optional()
-        .with_context(|| format!("failed to load latest checkpoint for thread {thread_id}"))
-    }
-
-    pub fn list_checkpoints(
-        &self,
-        thread_id: &str,
-        limit: Option<usize>,
-    ) -> Result<Vec<CheckpointRecord>> {
-        let conn = self.conn()?;
-        let limit = i64::try_from(limit.unwrap_or(100)).unwrap_or(100);
-        let mut stmt = conn
-            .prepare(
-                "SELECT thread_id, checkpoint_id, state_json, created_at FROM checkpoints WHERE thread_id = ?1 ORDER BY created_at DESC LIMIT ?2",
-            )
-            .context("failed to prepare checkpoint list query")?;
-        let mut rows = stmt
-            .query(params![thread_id, limit])
-            .with_context(|| format!("failed to list checkpoints for thread {thread_id}"))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().context("failed to iterate checkpoint rows")? {
-            let state_json: String = row.get(2).context("failed to read checkpoint state json")?;
-            let state = serde_json::from_str(&state_json).unwrap_or(Value::Null);
-            out.push(CheckpointRecord {
-                thread_id: row.get(0).context("failed to read checkpoint thread id")?,
-                checkpoint_id: row.get(1).context("failed to read checkpoint id")?,
-                state,
-                created_at: row.get(3).context("failed to read checkpoint timestamp")?,
-            });
-        }
-        Ok(out)
-    }
-
-    pub fn delete_checkpoint(&self, thread_id: &str, checkpoint_id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM checkpoints WHERE thread_id = ?1 AND checkpoint_id = ?2",
-            params![thread_id, checkpoint_id],
-        )
-        .with_context(|| {
-            format!("failed to delete checkpoint {checkpoint_id} for thread {thread_id}")
-        })?;
-        Ok(())
+        .context("failed to load checkpoint")
     }
 
     pub fn upsert_job(&self, job: &JobStateRecord) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            r#"
-            INSERT INTO jobs(id, name, status, progress, detail, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                status = excluded.status,
-                progress = excluded.progress,
-                detail = excluded.detail,
-                created_at = excluded.created_at,
-                updated_at = excluded.updated_at
-            "#,
+            "INSERT OR REPLACE INTO jobs (id, name, status, progress, detail, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 job.id,
                 job.name,
                 job_state_status_to_str(&job.status),
-                job.progress.map(i64::from),
+                job.progress,
                 job.detail,
                 job.created_at,
-                job.updated_at
+                job.updated_at,
             ],
-        )
-        .with_context(|| format!("failed to upsert job {}", job.id))?;
+        )?;
         Ok(())
     }
 
-    pub fn get_job(&self, id: &str) -> Result<Option<JobStateRecord>> {
+    pub fn list_jobs(&self) -> Result<Vec<JobStateRecord>> {
         let conn = self.conn()?;
-        conn.query_row(
-            "SELECT id, name, status, progress, detail, created_at, updated_at FROM jobs WHERE id = ?1",
-            params![id],
-            |row| {
-                let status_raw: String = row.get(2)?;
-                let progress: Option<i64> = row.get(3)?;
-                Ok(JobStateRecord {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    status: job_state_status_from_str(&status_raw),
-                    progress: progress.and_then(|v| u8::try_from(v).ok()),
-                    detail: row.get(4)?,
-                    created_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                })
-            },
-        )
-        .optional()
-        .with_context(|| format!("failed to read job {id}"))
-    }
-
-    pub fn list_jobs(&self, limit: Option<usize>) -> Result<Vec<JobStateRecord>> {
-        let conn = self.conn()?;
-        let limit = i64::try_from(limit.unwrap_or(100)).unwrap_or(100);
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, status, progress, detail, created_at, updated_at FROM jobs ORDER BY updated_at DESC LIMIT ?1",
-            )
-            .context("failed to prepare job list query")?;
-        let mut rows = stmt
-            .query(params![limit])
-            .context("failed to query persisted jobs")?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().context("failed to iterate persisted jobs")? {
-            let status_raw: String = row.get(2).context("failed to read job status")?;
-            let progress: Option<i64> = row.get(3).context("failed to read job progress")?;
-            out.push(JobStateRecord {
-                id: row.get(0).context("failed to read job id")?,
-                name: row.get(1).context("failed to read job name")?,
+        let mut stmt = conn.prepare(
+            "SELECT id, name, status, progress, detail, created_at, updated_at FROM jobs ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let status_raw: String = row.get(2)?;
+            Ok(JobStateRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
                 status: job_state_status_from_str(&status_raw),
-                progress: progress.and_then(|v| u8::try_from(v).ok()),
-                detail: row.get(4).context("failed to read job detail")?,
-                created_at: row.get(5).context("failed to read job created_at")?,
-                updated_at: row.get(6).context("failed to read job updated_at")?,
-            });
+                progress: row.get(3)?,
+                detail: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row?);
         }
-        Ok(out)
+        Ok(jobs)
     }
 
-    pub fn delete_job(&self, id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute("DELETE FROM jobs WHERE id = ?1", params![id])
-            .with_context(|| format!("failed to delete job {id}"))?;
-        Ok(())
-    }
-
-    pub fn find_rollout_path_by_id(&self, id: &str) -> Result<Option<PathBuf>> {
-        let conn = self.conn()?;
-        conn.query_row(
-            "SELECT rollout_path FROM threads WHERE id = ?1",
-            params![id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .context("failed to lookup rollout path")
-        .map(|opt| opt.flatten().map(PathBuf::from))
-    }
+    // ── Session Index (SQLite-based) ───────────────────────────────────────
 
     pub fn append_thread_name(
         &self,
@@ -744,95 +617,91 @@ impl StateStore {
         updated_at: i64,
         rollout_path: Option<PathBuf>,
     ) -> Result<()> {
-        if let Some(parent) = self.session_index_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create session index directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-        let entry = SessionIndexEntry {
-            thread_id: thread_id.to_string(),
-            thread_name,
-            updated_at,
-            rollout_path,
-        };
-        let encoded =
-            serde_json::to_string(&entry).context("failed to serialize session index entry")?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.session_index_path)
-            .with_context(|| {
-                format!(
-                    "failed to open session index {}",
-                    self.session_index_path.display()
-                )
-            })?;
-        writeln!(file, "{encoded}").context("failed to append session index entry")?;
-        Ok(())
+        self.with_busy_retry(|| {
+            let conn = self.conn()?;
+            conn.execute(
+                "INSERT OR REPLACE INTO session_index (thread_id, thread_name, updated_at, rollout_path) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    thread_id,
+                    thread_name,
+                    updated_at,
+                    rollout_path.clone().map(|p| p.display().to_string()),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn find_thread_name_by_id(&self, thread_id: &str) -> Result<Option<String>> {
-        let map = self.session_index_map()?;
-        Ok(map
-            .get(thread_id)
-            .and_then(|entry| entry.thread_name.clone()))
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT thread_name FROM session_index WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to find thread name")
     }
 
     pub fn find_thread_names_by_ids(
         &self,
         ids: &[String],
     ) -> Result<HashMap<String, Option<String>>> {
-        let map = self.session_index_map()?;
-        let mut out = HashMap::new();
-        for id in ids {
-            let name = map.get(id).and_then(|entry| entry.thread_name.clone());
-            out.insert(id.clone(), name);
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn()?;
+        let placeholders: Vec<String> = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+        let query = format!(
+            "SELECT thread_id, thread_name FROM session_index WHERE thread_id IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut out: HashMap<String, Option<String>> = ids.iter().map(|id| (id.clone(), None)).collect();
+        for row in rows {
+            let (id, name): (String, Option<String>) = row?;
+            out.insert(id, name);
         }
         Ok(out)
     }
 
     pub fn find_thread_path_by_name_str(&self, name: &str) -> Result<Option<PathBuf>> {
-        let map = self.session_index_map()?;
-        let matched = map
-            .values()
-            .filter(|entry| {
-                entry
-                    .thread_name
-                    .as_deref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
-            })
-            .max_by_key(|entry| entry.updated_at);
-        Ok(matched.and_then(|entry| entry.rollout_path.clone()))
+        let conn = self.conn()?;
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT rollout_path FROM session_index WHERE thread_name = ?1 COLLATE NOCASE ORDER BY updated_at DESC LIMIT 1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to find thread path by name")?;
+        Ok(result.map(PathBuf::from))
     }
 
     fn session_index_map(&self) -> Result<HashMap<String, SessionIndexEntry>> {
-        if !self.session_index_path.exists() {
-            return Ok(HashMap::new());
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT thread_id, thread_name, updated_at, rollout_path FROM session_index",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let rollout: Option<String> = row.get(3)?;
+            Ok(SessionIndexEntry {
+                thread_id: row.get(0)?,
+                thread_name: row.get(1)?,
+                updated_at: row.get(2)?,
+                rollout_path: rollout.map(PathBuf::from),
+            })
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let entry = row?;
+            map.insert(entry.thread_id.clone(), entry);
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .open(&self.session_index_path)
-            .with_context(|| {
-                format!(
-                    "failed to read session index {}",
-                    self.session_index_path.display()
-                )
-            })?;
-        let reader = BufReader::new(file);
-        let mut latest = HashMap::<String, SessionIndexEntry>::new();
-        for line in reader.lines() {
-            let line = line.context("failed to read session index line")?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let parsed: SessionIndexEntry =
-                serde_json::from_str(&line).context("failed to parse session index entry")?;
-            latest.insert(parsed.thread_id.clone(), parsed);
-        }
-        Ok(latest)
+        Ok(map)
     }
 }
 
@@ -894,10 +763,6 @@ fn session_source_from_str(value: &str) -> SessionSource {
     }
 }
 
-fn path_to_opt_string(path: Option<&Path>) -> Option<String> {
-    path.map(|p| p.display().to_string())
-}
-
 fn job_state_status_to_str(status: &JobStateStatus) -> &'static str {
     match status {
         JobStateStatus::Queued => "queued",
@@ -917,6 +782,10 @@ fn job_state_status_from_str(value: &str) -> JobStateStatus {
         "cancelled" => JobStateStatus::Cancelled,
         _ => JobStateStatus::Queued,
     }
+}
+
+fn path_to_opt_string(path: Option<&Path>) -> Option<String> {
+    path.map(|p| p.display().to_string())
 }
 
 fn row_to_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadMetadata> {

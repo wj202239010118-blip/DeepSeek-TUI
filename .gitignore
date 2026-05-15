@@ -114,3 +114,9 @@ docs/*_PLAN.md
 # direnv
 .envrc
 .direnv
+  
+# Local temp files (MCP bridge cache, etc.)  
+temp_body.json  
+  
+# Companion tools package-lock (tools are tracked separately)  
+tools/*/package-lock.json 

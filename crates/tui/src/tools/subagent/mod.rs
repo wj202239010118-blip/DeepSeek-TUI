@@ -908,6 +908,8 @@ pub struct SubAgentManager {
     /// agents whose `session_boot_id` doesn't match this value as
     /// "from prior session" so `agent_list` can hide them by default.
     current_session_boot_id: String,
+    /// Timestamp of last cleanup to avoid scanning every spawn (P4 optimization).
+    last_cleanup: Instant,
 }
 
 impl SubAgentManager {
@@ -923,6 +925,7 @@ impl SubAgentManager {
             // Fresh boot id per manager. Used by #405 to classify
             // re-loaded persisted agents as "prior session".
             current_session_boot_id: format!("boot_{}", &Uuid::new_v4().to_string()[..12]),
+            last_cleanup: Instant::now(),
         }
     }
 
@@ -984,7 +987,7 @@ impl SubAgentManager {
         write_json_atomic(path, &payload)
     }
 
-    fn persist_state_best_effort(&self) {
+    pub(crate) fn persist_state_best_effort(&self) {
         if let Err(err) = self.persist_state() {
             // Must not be `eprintln!` — raw stderr inside the alt-screen
             // leaks into the buffer and produces the scroll-demon
@@ -1132,7 +1135,13 @@ impl SubAgentManager {
         allowed_tools: Option<Vec<String>>,
         options: SubAgentSpawnOptions,
     ) -> Result<SubAgentResult> {
-        self.cleanup(COMPLETED_AGENT_RETENTION);
+        // Lazy cleanup: only scan every 30s to avoid O(n) agent scan per spawn.
+        // P0 already moved persist out of the write-lock hot path; this further
+        // reduces write-lock hold time during high-frequency spawn bursts.
+        if self.last_cleanup.elapsed() >= Duration::from_secs(30) {
+            self.cleanup(COMPLETED_AGENT_RETENTION);
+            self.last_cleanup = Instant::now();
+        }
 
         if self.running_count() >= self.max_agents {
             return Err(anyhow!(
@@ -1208,7 +1217,7 @@ impl SubAgentManager {
         );
         agent.task_handle = Some(handle);
         self.agents.insert(agent_id.clone(), agent);
-        self.persist_state_best_effort();
+        // Persistence deferred to caller — write lock is released first.
 
         Ok(self
             .agents
@@ -1559,7 +1568,7 @@ impl SubAgentManager {
             changed = true;
         }
         if changed {
-            self.persist_state_best_effort();
+            // Persistence deferred to caller — write lock is released first.
         }
     }
 
@@ -1572,7 +1581,7 @@ impl SubAgentManager {
             changed = true;
         }
         if changed {
-            self.persist_state_best_effort();
+            // Persistence deferred to caller — write lock is released first.
         }
     }
 }
@@ -3184,10 +3193,17 @@ async fn run_subagent_task(task: SubAgentTask) {
     )
     .await;
 
-    let mut manager = task.manager_handle.write().await;
-    match &result {
-        Ok(res) => manager.update_from_result(&task.agent_id, res.clone()),
-        Err(err) => manager.update_failed(&task.agent_id, err.to_string()),
+    {
+        let mut manager = task.manager_handle.write().await;
+        match &result {
+            Ok(res) => manager.update_from_result(&task.agent_id, res.clone()),
+            Err(err) => manager.update_failed(&task.agent_id, err.to_string()),
+        }
+    } // write lock released before persist to avoid blocking concurrent spawns
+    // Persist state outside the write lock so disk I/O doesn't hold the lock.
+    {
+        let manager = task.manager_handle.read().await;
+        manager.persist_state_best_effort();
     }
 
     // Emit BOTH a human-friendly summary (rendered in the parent's

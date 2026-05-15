@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 use crate::config::{ApiProvider, Config, RetryPolicy};
 use crate::llm_client::{
@@ -129,14 +129,14 @@ pub struct DeepSeekClient {
     retry: RetryPolicy,
     default_model: String,
     connection_health: Arc<AsyncMutex<ConnectionHealth>>,
-    rate_limiter: Arc<AsyncMutex<TokenBucket>>,
+    concurrency_semaphore: Arc<Semaphore>,
 }
 
 const CONNECTION_FAILURE_THRESHOLD: u32 = 2;
 const RECOVERY_PROBE_COOLDOWN: Duration = Duration::from_secs(15);
 
-const DEFAULT_CLIENT_RATE_LIMIT_RPS: f64 = 8.0;
-const DEFAULT_CLIENT_RATE_LIMIT_BURST: f64 = 16.0;
+// DEFAULT_CLIENT_RATE_LIMIT_RPS replaced by DEEPSEEK_MAX_CONCURRENT_REQUESTS env var
+// DEFAULT_CLIENT_RATE_LIMIT_BURST replaced by Semaphore max permits
 const ALLOW_INSECURE_HTTP_ENV: &str = "DEEPSEEK_ALLOW_INSECURE_HTTP";
 
 pub(super) const SSE_BACKPRESSURE_HIGH_WATERMARK: usize = 8 * 1024 * 1024; // 8 MB
@@ -170,64 +170,7 @@ impl Default for ConnectionHealth {
     }
 }
 
-#[derive(Debug)]
-struct TokenBucket {
-    enabled: bool,
-    capacity: f64,
-    tokens: f64,
-    refill_per_sec: f64,
-    last_refill: Instant,
-}
-
-impl TokenBucket {
-    fn from_env() -> Self {
-        let rps = std::env::var("DEEPSEEK_RATE_LIMIT_RPS")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(DEFAULT_CLIENT_RATE_LIMIT_RPS)
-            .max(0.0);
-        let burst = std::env::var("DEEPSEEK_RATE_LIMIT_BURST")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(DEFAULT_CLIENT_RATE_LIMIT_BURST)
-            .max(1.0);
-        let enabled = rps > 0.0;
-        Self {
-            enabled,
-            capacity: burst,
-            tokens: burst,
-            refill_per_sec: rps,
-            last_refill: Instant::now(),
-        }
-    }
-
-    fn refill(&mut self, now: Instant) {
-        if !self.enabled {
-            return;
-        }
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.last_refill = now;
-        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
-    }
-
-    fn delay_until_available(&mut self, tokens: f64) -> Option<Duration> {
-        if !self.enabled {
-            return None;
-        }
-        let now = Instant::now();
-        self.refill(now);
-        if self.tokens >= tokens {
-            self.tokens -= tokens;
-            return None;
-        }
-        let needed = tokens - self.tokens;
-        self.tokens = 0.0;
-        if self.refill_per_sec <= 0.0 {
-            return Some(Duration::from_secs(1));
-        }
-        Some(Duration::from_secs_f64(needed / self.refill_per_sec))
-    }
-}
+// TokenBucket replaced with Semaphore for fairer concurrency control.
 
 fn apply_request_success(health: &mut ConnectionHealth, now: Instant) -> bool {
     let recovered = health.state != ConnectionState::Healthy;
@@ -295,7 +238,7 @@ impl Clone for DeepSeekClient {
             retry: self.retry.clone(),
             default_model: self.default_model.clone(),
             connection_health: self.connection_health.clone(),
-            rate_limiter: self.rate_limiter.clone(),
+            concurrency_semaphore: self.concurrency_semaphore.clone(),
         }
     }
 }
@@ -502,7 +445,14 @@ impl DeepSeekClient {
             retry,
             default_model,
             connection_health: Arc::new(AsyncMutex::new(ConnectionHealth::default())),
-            rate_limiter: Arc::new(AsyncMutex::new(TokenBucket::from_env())),
+            concurrency_semaphore: {
+                let max_concurrent = std::env::var("DEEPSEEK_MAX_CONCURRENT_REQUESTS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(8)
+                    .max(1);
+                Arc::new(Semaphore::new(max_concurrent))
+            },
         })
     }
 
@@ -643,14 +593,14 @@ impl DeepSeekClient {
         parse_models_response(&response_text)
     }
 
-    async fn wait_for_rate_limit(&self) {
-        let maybe_delay = {
-            let mut limiter = self.rate_limiter.lock().await;
-            limiter.delay_until_available(1.0)
-        };
-        if let Some(delay) = maybe_delay {
-            tokio::time::sleep(delay).await;
-        }
+    /// Acquire a concurrency permit from the semaphore (replaces TokenBucket).
+    /// Returns the permit — drop it after the request completes to release the slot.
+    async fn acquire_concurrency_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.concurrency_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("Semaphore should never be closed")
     }
 
     async fn mark_request_success(&self) {
@@ -699,13 +649,13 @@ impl DeepSeekClient {
     where
         F: FnMut() -> reqwest::RequestBuilder,
     {
+        let _permit = self.acquire_concurrency_permit().await;
         let retry_cfg: LlmRetryConfig = self.retry.clone().into();
         let request_result = with_retry(
             &retry_cfg,
             || {
                 let request = build();
                 async move {
-                    self.wait_for_rate_limit().await;
                     let response = request
                         .send()
                         .await
@@ -789,7 +739,7 @@ impl LlmClient for DeepSeekClient {
 
     async fn health_check(&self) -> Result<bool> {
         let health_url = api_url(&self.base_url, "models");
-        self.wait_for_rate_limit().await;
+        let _permit = self.acquire_concurrency_permit().await;
         let response = self.http_client.get(health_url).send().await;
         match response {
             Ok(resp) if resp.status().is_success() => {
@@ -2775,26 +2725,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn token_bucket_enforces_delay_when_empty() {
-        let now = Instant::now();
-        let mut bucket = TokenBucket {
-            enabled: true,
-            capacity: 1.0,
-            tokens: 1.0,
-            refill_per_sec: 2.0,
-            last_refill: now,
-        };
-
-        assert!(bucket.delay_until_available(1.0).is_none());
-        let delay = bucket
-            .delay_until_available(1.0)
-            .expect("bucket should require refill delay");
-        assert!(
-            delay >= Duration::from_millis(400) && delay <= Duration::from_millis(600),
-            "unexpected refill delay: {delay:?}"
-        );
-    }
 
     #[test]
     fn stream_buffer_pool_reuses_released_buffers() {

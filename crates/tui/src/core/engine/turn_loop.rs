@@ -43,7 +43,7 @@ impl Engine {
 
         loop {
             if self.cancel_token.is_cancelled() {
-                let _ = self.tx_event.send(Event::status("Request cancelled")).await;
+                self.send_status("Request cancelled");
                 return (TurnOutcomeStatus::Interrupted, None);
             }
 
@@ -57,23 +57,17 @@ impl Engine {
                     .observe_user_message(&steer, &self.session.workspace);
                 self.add_session_message(self.user_text_message_with_turn_metadata(steer.clone()))
                     .await;
-                let _ = self
-                    .tx_event
-                    .send(Event::status(format!(
-                        "Steer input accepted: {}",
-                        summarize_text(&steer, 120)
-                    )))
-                    .await;
+                self.send_status(format!(
+                    "Steer input accepted: {}",
+                    summarize_text(&steer, 120)
+                ));
             }
 
             // Ensure system prompt is up to date with latest session states
             self.refresh_system_prompt(mode);
 
             if turn.at_max_steps() {
-                let _ = self
-                    .tx_event
-                    .send(Event::status("Reached maximum steps"))
-                    .await;
+                self.send_status("Reached maximum steps");
                 break;
             }
 
@@ -99,10 +93,7 @@ impl Engine {
                     "Auto context compaction started".to_string(),
                 )
                 .await;
-                let _ = self
-                    .tx_event
-                    .send(Event::status("Auto-compacting context...".to_string()))
-                    .await;
+                self.send_status("Auto-compacting context...");
                 let auto_messages_before = self.session.messages.len();
                 match compact_messages_safe(
                     &client,
@@ -140,7 +131,7 @@ impl Engine {
                                 Some(auto_messages_after),
                             )
                             .await;
-                            let _ = self.tx_event.send(Event::status(status)).await;
+                            self.send_status(status);
                         } else {
                             let message = "Auto-compaction skipped: empty result".to_string();
                             self.emit_compaction_failed(
@@ -149,7 +140,7 @@ impl Engine {
                                 message.clone(),
                             )
                             .await;
-                            let _ = self.tx_event.send(Event::status(message)).await;
+                            self.send_status(message);
                         }
                     }
                     Err(err) => {
@@ -157,7 +148,7 @@ impl Engine {
                         let message = format!("Auto-compaction failed: {err}");
                         self.emit_compaction_failed(compaction_id, true, message.clone())
                             .await;
-                        let _ = self.tx_event.send(Event::status(message)).await;
+                        self.send_status(message);
                     }
                 }
             }
@@ -403,13 +394,10 @@ impl Engine {
                         continue;
                     }
                     pending_steers.push(steer.clone());
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Steer input queued: {}",
-                            summarize_text(&steer, 120)
-                        )))
-                        .await;
+                    self.send_status(format!(
+                        "Steer input queued: {}",
+                        summarize_text(&steer, 120)
+                    ));
                 }
 
                 if self.cancel_token.is_cancelled() {
@@ -528,7 +516,7 @@ impl Engine {
                                 && contains_fake_tool_wrapper(&current_text_raw)
                             {
                                 let _ =
-                                    self.tx_event.send(Event::status(FAKE_WRAPPER_NOTICE)).await;
+                                    self.send_status(FAKE_WRAPPER_NOTICE);
                                 fake_wrapper_notice_emitted = true;
                             }
                             current_text_visible.push_str(&filtered);
@@ -601,7 +589,7 @@ impl Engine {
                                 && contains_fake_tool_wrapper(&text)
                             {
                                 let _ =
-                                    self.tx_event.send(Event::status(FAKE_WRAPPER_NOTICE)).await;
+                                    self.send_status(FAKE_WRAPPER_NOTICE);
                                 fake_wrapper_notice_emitted = true;
                             }
                             if !filtered.is_empty() {
@@ -1056,7 +1044,7 @@ impl Engine {
                 match self.ensure_mcp_pool().await {
                     Ok(pool) => Some(pool),
                     Err(err) => {
-                        let _ = self.tx_event.send(Event::status(err.to_string())).await;
+                        self.send_status(err.to_string());
                         None
                     }
                 }
@@ -1203,7 +1191,7 @@ impl Engine {
                                 tool_name, requested_tool_name
                             )
                         };
-                        let _ = self.tx_event.send(Event::status(status)).await;
+                        self.send_status(status);
                     }
                     guard_result = Some(result);
                 }
@@ -1741,7 +1729,7 @@ impl Engine {
                             OutcomeDecision::Continue => {}
                             OutcomeDecision::Warn(message) => {
                                 crate::logging::warn(message.clone());
-                                let _ = self.tx_event.send(Event::status(message)).await;
+                                self.send_status(message);
                             }
                             OutcomeDecision::Halt(message) => {
                                 loop_guard_halt.get_or_insert(message);
@@ -1799,7 +1787,7 @@ impl Engine {
                             OutcomeDecision::Continue => {}
                             OutcomeDecision::Warn(message) => {
                                 crate::logging::warn(message.clone());
-                                let _ = self.tx_event.send(Event::status(message)).await;
+                                self.send_status(message);
                             }
                             OutcomeDecision::Halt(message) => {
                                 loop_guard_halt.get_or_insert(message);
@@ -1848,7 +1836,7 @@ impl Engine {
 
             if let Some(message) = loop_guard_halt {
                 crate::logging::warn(message.clone());
-                let _ = self.tx_event.send(Event::status(message)).await;
+                self.send_status(message);
                 break;
             }
 

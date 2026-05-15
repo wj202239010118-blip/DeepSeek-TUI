@@ -534,7 +534,7 @@ impl Renderable for ComposerWidget<'_> {
             composer_input_rows_budget(inner_area.height, menu_lines_for_budget);
         let content_width = usize::from(inner_area.width.max(1));
         let (visible_lines, _cursor_row, _cursor_col) =
-            layout_input(input_text, input_cursor, content_width, input_rows_budget);
+            layout_input(input_text, input_cursor, content_width, input_rows_budget, self.app.composer.composer_scroll_row);
         let is_draft_mode = input_text.contains('\n') || visible_lines.len() > 1;
         if has_panel {
             let border_color = if input_text.trim().is_empty() {
@@ -673,6 +673,15 @@ impl Renderable for ComposerWidget<'_> {
             input_lines.push(Line::from(Span::styled(
                 placeholder,
                 Style::default().fg(palette::TEXT_MUTED).italic(),
+            )));
+        } else if let Some(pill_label) = self.app.composer_paste_pill_label() {
+            // Paste pill display: render `[Pasted text #N +X lines]` with a
+            // distinct cyan style so it's visually distinct from typed text.
+            input_lines.push(Line::from(Span::styled(
+                pill_label,
+                Style::default()
+                    .fg(ratatui::style::Color::Cyan)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
             )));
         } else {
             for line in &visible_lines {
@@ -991,7 +1000,7 @@ impl Renderable for ComposerWidget<'_> {
             composer_input_rows_budget(inner_area.height, self.active_menu_reserved_rows());
 
         let (visible_lines, cursor_row, cursor_col) =
-            layout_input(input_text, input_cursor, content_width, input_rows_budget);
+            layout_input(input_text, input_cursor, content_width, input_rows_budget, self.app.composer.composer_scroll_row);
         let visual_rows = if input_text.is_empty() {
             let placeholder = if self.app.is_history_search_active() {
                 self.app
@@ -2135,6 +2144,7 @@ fn layout_input(
     cursor: usize,
     width: usize,
     max_height: usize,
+    scroll_row: usize,
 ) -> (Vec<String>, usize, usize) {
     let mut lines = wrap_input_lines(input, width);
     if lines.is_empty() {
@@ -2143,13 +2153,18 @@ fn layout_input(
     let (cursor_row, cursor_col) = cursor_row_col(input, cursor, width.max(1));
 
     let max_height = max_height.max(1);
-    let mut start = 0usize;
-    if cursor_row >= max_height {
-        start = cursor_row + 1 - max_height;
-    }
-    if start + max_height > lines.len() {
-        start = lines.len().saturating_sub(max_height);
-    }
+    let start = if scroll_row > 0 {
+        scroll_row.min(lines.len().saturating_sub(max_height))
+    } else {
+        let mut s = 0usize;
+        if cursor_row >= max_height {
+            s = cursor_row + 1 - max_height;
+        }
+        if s + max_height > lines.len() {
+            s = lines.len().saturating_sub(max_height);
+        }
+        s
+    };
     let visible = lines
         .into_iter()
         .skip(start)

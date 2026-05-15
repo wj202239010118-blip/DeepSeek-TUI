@@ -250,7 +250,7 @@ pub struct EngineHandle {
     /// Send operations to the engine
     pub tx_op: mpsc::Sender<Op>,
     /// Receive events from the engine
-    pub rx_event: Arc<RwLock<mpsc::Receiver<Event>>>,
+    pub rx_event: Arc<AsyncMutex<mpsc::Receiver<Event>>>,
     /// Shared pointer to the cancellation token for the current request.
     cancel_token: Arc<StdMutex<CancellationToken>>,
     /// Latched reason for the most recent cancellation. Read by the
@@ -348,6 +348,14 @@ impl Engine {
         }
     }
 
+    /// Send a status event without blocking. Status events are informational
+    /// and can be dropped if the event channel is full (P7). This prevents
+    /// the engine worker from deadlocking when the UI loop is busy drawing
+    /// or processing a burst of events.
+    fn send_status(&self, msg: impl Into<String>) {
+        let _ = self.tx_event.try_send(Event::status(msg.into()));
+    }
+
     fn env_only_api_key_recovery_hint(api_config: &Config) -> Option<String> {
         if !crate::config::active_provider_uses_env_only_api_key(api_config) {
             return None;
@@ -391,7 +399,7 @@ impl Engine {
     /// Create a new engine with the given configuration
     pub fn new(config: EngineConfig, api_config: &Config) -> (Self, EngineHandle) {
         let (tx_op, rx_op) = mpsc::channel(32);
-        let (tx_event, rx_event) = mpsc::channel(256);
+        let (tx_event, rx_event) = mpsc::channel(4096); // P6: increased from 256 to reduce backpressure
         let (tx_approval, rx_approval) = mpsc::channel(64);
         let (tx_user_input, rx_user_input) = mpsc::channel(32);
         let (tx_steer, rx_steer) = mpsc::channel(64);
@@ -560,7 +568,7 @@ impl Engine {
 
         let handle = EngineHandle {
             tx_op,
-            rx_event: Arc::new(RwLock::new(rx_event)),
+            rx_event: Arc::new(AsyncMutex::new(rx_event)),
             cancel_token: shared_cancel_token,
             cancel_reason,
             tx_approval,
@@ -612,16 +620,10 @@ impl Engine {
                 }
                 Op::ApproveToolCall { id } => {
                     // Tool approval handling will be implemented in tools module
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!("Approved tool call: {id}")))
-                        .await;
+                    self.send_status(format!("Approved tool call: {id}"));
                 }
                 Op::DenyToolCall { id } => {
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!("Denied tool call: {id}")))
-                        .await;
+                    self.send_status(format!("Denied tool call: {id}"));
                 }
                 Op::SpawnSubAgent { prompt } => {
                     let Some(client) = self.deepseek_client.clone() else {
@@ -670,17 +672,20 @@ impl Engine {
                             prompt.clone(),
                             None,
                         )
-                    };
+                    }; // write lock released before persist
+                    // Persist state outside the write lock so disk I/O doesn't block
+                    // concurrent sub-agent operations.
+                    {
+                        let manager = self.subagent_manager.read().await;
+                        manager.persist_state_best_effort();
+                    }
 
                     match result {
                         Ok(snapshot) => {
-                            let _ = self
-                                .tx_event
-                                .send(Event::status(format!(
+                            self.send_status(format!(
                                     "Spawned sub-agent {}",
                                     snapshot.agent_id
-                                )))
-                                .await;
+                                ));
                         }
                         Err(err) => {
                             let _ = self
@@ -701,33 +706,24 @@ impl Engine {
                     let _ = self.tx_event.send(Event::AgentList { agents }).await;
                 }
                 Op::ChangeMode { mode } => {
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!("Mode changed to: {mode:?}")))
-                        .await;
+                    self.send_status(format!("Mode changed to: {mode:?}"));
                 }
                 Op::SetModel { model } => {
                     self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
                     self.session.model = model;
                     self.config.model.clone_from(&self.session.model);
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                    self.send_status(format!(
                             "Model set to: {}",
                             self.session.model
-                        )))
-                        .await;
+                        ));
                 }
                 Op::SetCompaction { config } => {
                     let enabled = config.enabled;
                     self.config.compaction = config;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                    self.send_status(format!(
                             "Auto-compaction {}",
                             if enabled { "enabled" } else { "disabled" }
-                        )))
-                        .await;
+                        ));
                 }
                 Op::SyncSession {
                     session_id,
@@ -750,7 +746,7 @@ impl Engine {
                     self.session.workspace = workspace.clone();
                     self.config.model.clone_from(&self.session.model);
                     self.config.workspace = workspace.clone();
-                    let ctx = crate::project_context::load_project_context_with_parents(&workspace);
+                    let ctx = crate::project_context::load_project_context_async(workspace.clone()).await;
                     self.session.project_context = if ctx.has_instructions() {
                         Some(ctx)
                     } else {
@@ -759,10 +755,7 @@ impl Engine {
                     self.session.rebuild_working_set();
                     self.rehydrate_latest_canonical_state();
                     self.emit_session_updated().await;
-                    let _ = self
-                        .tx_event
-                        .send(Event::status("Session context synced".to_string()))
-                        .await;
+                    self.send_status("Session context synced".to_string());
                 }
                 Op::CompactContext => {
                     self.handle_manual_compaction().await;
@@ -1231,7 +1224,7 @@ impl Engine {
                 let message = format!("Manual context compaction failed: {err}");
                 self.emit_compaction_failed(id, false, message.clone())
                     .await;
-                let _ = self.tx_event.send(Event::status(message.clone())).await;
+                self.send_status(message.clone());
                 turn_status = TurnOutcomeStatus::Failed;
                 turn_error = Some(message);
             }
@@ -1316,12 +1309,9 @@ impl Engine {
                 summary_prompt = result.summary_prompt;
             }
             Err(err) => {
-                let _ = self
-                    .tx_event
-                    .send(Event::status(format!(
+                self.send_status(format!(
                         "Emergency compaction API pass failed: {err}. Falling back to local trim."
-                    )))
-                    .await;
+                    ));
             }
         }
 
@@ -1356,7 +1346,7 @@ impl Engine {
                 Some(after_count),
             )
             .await;
-            let _ = self.tx_event.send(Event::status(details)).await;
+            self.send_status(details);
             return true;
         }
 
@@ -1366,7 +1356,7 @@ impl Engine {
             after_tokens, target_budget
         );
         self.emit_compaction_failed(id, true, message.clone()).await;
-        let _ = self.tx_event.send(Event::status(message)).await;
+        self.send_status(message);
         false
     }
 
@@ -1452,7 +1442,7 @@ impl Engine {
         let pool = match self.ensure_mcp_pool().await {
             Ok(pool) => pool,
             Err(err) => {
-                let _ = self.tx_event.send(Event::status(err.to_string())).await;
+                self.send_status(err.to_string());
                 return Vec::new();
             }
         };
@@ -1460,12 +1450,9 @@ impl Engine {
         let mut pool = pool.lock().await;
         let errors = pool.connect_all().await;
         for (server, err) in errors {
-            let _ = self
-                .tx_event
-                .send(Event::status(format!(
+            self.send_status(format!(
                     "Failed to connect MCP server '{server}': {err:#}"
-                )))
-                .await;
+                ));
         }
 
         pool.to_api_tools()
@@ -1506,12 +1493,9 @@ impl Engine {
             .working_set
             .pinned_message_indices(&self.session.messages, &self.session.workspace);
 
-        let _ = self
-            .tx_event
-            .send(Event::status(format!(
+        self.send_status(format!(
                 "⏻ producing L{level} context seam ({msg_range_end} messages)…"
-            )))
-            .await;
+            ));
 
         // If we have existing seams, recompact; otherwise produce fresh.
         let existing_seams = seam_mgr.collect_seam_texts(&self.session.messages).await;
@@ -1567,12 +1551,9 @@ impl Engine {
         })
         .await;
 
-        let _ = self
-            .tx_event
-            .send(Event::status(format!(
+        self.send_status(format!(
                 "⏻ L{level} seam complete ({seam_count} total, {msg_range_end} messages covered)"
-            )))
-            .await;
+            ));
     }
     /// its token threshold (issue #124). No-op in the common case.
     ///
@@ -1608,12 +1589,9 @@ impl Engine {
         let archive_started = self.session.current_cycle_started;
         let max_briefing_tokens = self.config.cycle.briefing_max_for(&self.session.model);
 
-        let _ = self
-            .tx_event
-            .send(Event::status(format!(
+        self.send_status(format!(
                 "↻ context refreshing (cycle {from} → {to}, generating briefing…)"
-            )))
-            .await;
+            ));
 
         // 1. Generate the model-curated briefing. Prefer the Flash seam
         //    manager (#159) for cost and speed; fall back to the main model
@@ -1655,12 +1633,9 @@ impl Engine {
                             crate::logging::warn(format!(
                                 "Cycle briefing turn failed; skipping cycle advance: {err2}"
                             ));
-                            let _ = self
-                                .tx_event
-                                .send(Event::status(format!(
+                            self.send_status(format!(
                                     "↻ cycle handoff failed (continuing in cycle {from}): {err2}"
-                                )))
-                                .await;
+                                ));
                             return;
                         }
                     }
@@ -1680,12 +1655,9 @@ impl Engine {
                     crate::logging::warn(format!(
                         "Cycle briefing turn failed; skipping cycle advance: {err}"
                     ));
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                    self.send_status(format!(
                             "↻ cycle handoff failed (continuing in cycle {from}): {err}"
-                        )))
-                        .await;
+                        ));
                     return;
                 }
             }
@@ -1765,12 +1737,9 @@ impl Engine {
                 briefing: briefing.clone(),
             })
             .await;
-        let _ = self
-            .tx_event
-            .send(Event::status(format!(
+        self.send_status(format!(
                 "↻ context refreshed (cycle {from} → {to}, briefing: {briefing_tokens} tokens carried)"
-            )))
-            .await;
+            ));
     }
 
     /// Refresh the system prompt based on current mode and context.
@@ -1895,7 +1864,7 @@ impl MockEngineHandle {
 #[cfg(test)]
 pub(crate) fn mock_engine_handle() -> MockEngineHandle {
     let (tx_op, rx_op) = mpsc::channel(32);
-    let (tx_event, rx_event) = mpsc::channel(256);
+    let (tx_event, rx_event) = mpsc::channel(4096); // P6: increased from 256 to reduce backpressure
     let (tx_approval, rx_approval) = mpsc::channel(64);
     let (tx_user_input, _rx_user_input) = mpsc::channel(32);
     let (tx_steer, rx_steer) = mpsc::channel(64);
@@ -1904,7 +1873,7 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
     let cancel_reason: Arc<StdMutex<Option<CancelReason>>> = Arc::new(StdMutex::new(None));
     let handle = EngineHandle {
         tx_op,
-        rx_event: Arc::new(RwLock::new(rx_event)),
+        rx_event: Arc::new(AsyncMutex::new(rx_event)),
         cancel_token: shared_cancel_token,
         cancel_reason,
         tx_approval,

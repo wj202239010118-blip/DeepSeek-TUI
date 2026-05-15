@@ -2071,7 +2071,7 @@ impl RuntimeThreadManager {
 
         loop {
             let event = {
-                let mut rx = engine.rx_event.write().await;
+                let mut rx = engine.rx_event.lock().await;
                 rx.recv().await
             };
             let Some(event) = event else {

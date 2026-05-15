@@ -890,7 +890,7 @@ async fn session_update_preserves_reasoning_tool_only_turn() {
     engine.add_session_message(assistant.clone()).await;
 
     let event = {
-        let mut rx = handle.rx_event.write().await;
+        let mut rx = handle.rx_event.lock().await;
         rx.recv().await.expect("session update event")
     };
     let Event::SessionUpdated { messages, .. } = event else {
